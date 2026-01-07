@@ -6,7 +6,7 @@ services:
     container_name: measurement-api
     restart: always
     ports:
-      - "6101:80"  # Expose on port 8000 of your host machine
+      - "8512:8512"  # Expose on port 8000 of your host machine
     networks:
       - lavie_database
     environment:
