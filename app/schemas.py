@@ -14,7 +14,6 @@ class StudySummary(BaseModel):
     referral_id: int
     study_id: str             # The ID you want to select by
     patient_id: str
-    patient_name: str
     has_measurements: bool    # Helper to see if data exists
 
     class Config:

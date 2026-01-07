@@ -31,7 +31,6 @@ def list_measurements(
             referral_id=ref.id,
             study_id=ref.study_id,
             patient_id=ref.patient_id,
-            patient_name=f"{ref.patient_firstname} {ref.patient_lastname}",
             has_measurements=has_data
         ))
     return results
