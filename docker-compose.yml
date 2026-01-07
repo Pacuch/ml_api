@@ -13,7 +13,7 @@ services:
       DB_HOST: lavie_postgres
       DB_USER: postgres
       DB_PASSWORD: postgres
-      DB_NAME: postgres
+      DB_NAME: lavie
 
 networks:
   lavie_database:
