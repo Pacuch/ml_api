@@ -8,7 +8,7 @@ class Referral(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     study_id = Column(String)
-    # patient_id = Column(String, index=True)
+    patient_id = Column(String, index=True)
 
     # Relationship: One Referral has many StudyDescriptions
     study_descriptions = relationship("StudyDescription", back_populates="referral")

@@ -9,6 +9,8 @@ services:
       - "8512:8512"  # Expose on port 8000 of your host machine
     networks:
       - lavie_database
+    env_file:
+      - .envs/ml.env
     environment:
       DB_HOST: lavie_postgres
       DB_USER: postgres
