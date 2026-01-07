@@ -37,15 +37,15 @@ def list_measurements(
     for ref in referrals:
         # Check if any descriptions exist
         has_data = len(ref.study_descriptions) > 0
+        if has_data:
+            hashed_id = hash_patient_id(ref.patient_id)
 
-        hashed_id = hash_patient_id(ref.patient_id)
-
-        results.append(schemas.StudySummary(
-            referral_id=ref.id,
-            study_id=ref.study_id,
-            patient_id=hashed_id,
-            has_measurements=has_data
-        ))
+            results.append(schemas.StudySummary(
+                referral_id=ref.id,
+                study_id=ref.study_id,
+                patient_id=hashed_id
+                # has_measurements=has_data
+            ))
     return results
 
 
