@@ -12,4 +12,4 @@ COPY ./app ./app
 
 # 3. Command to run the application
 # We use host 0.0.0.0 so it is accessible outside the container
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8512"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8512"]
