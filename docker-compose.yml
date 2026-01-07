@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  ml_api:
+    build: .
+    container_name: measurement-api
+    restart: always
+    ports:
+      - "6101:80"  # Expose on port 8000 of your host machine
+    networks:
+      - lavie_database
+    environment:
+      DB_HOST: lavie_postgres
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: postgres
+
+networks:
+  lavie_database:
+    external: true
