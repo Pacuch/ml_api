@@ -10,12 +10,13 @@ def get_referral_by_study_id(db: Session, study_id: str):
 
 # 2. Get all studies (The "Read all" part)
 # We use skip/limit for pagination so we don't crash the server with 100k rows
-def get_all_referrals(db: Session, skip: int = 0, limit: int = 100, status: int = None):
+def get_all_referrals(db: Session, skip: int = 0, limit: int = 100, min_status: int = None):
     query = db.query(models.Referral)
 
-    # Apply filter if status is provided
-    if status is not None:
-        query = query.filter(models.Referral.status == status)
+    if min_status is not None:
+        # Started (5), Saved (6), Signed (7)
+        query = query.filter(models.Referral.status >= min_status)
+
 
     return query.order_by(desc(models.Referral.study_datetime)) \
         .offset(skip) \

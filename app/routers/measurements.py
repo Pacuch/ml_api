@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from .. import schemas, crud, database
 
 from ..core.security import get_api_key, hash_patient_id
-from ..core.config import STATUS_SIGNED
+from ..core.config import STATUS_SIGNED, STATUS_STARTED
 
 router = APIRouter(
     prefix="/measurements",
@@ -21,7 +21,7 @@ def list_measurements(
         db: Session = Depends(database.get_db)
 ):
     # Note: Added STATUS_SIGNED here based on your previous request
-    referrals = crud.get_all_referrals(db, skip=skip, limit=limit)
+    referrals = crud.get_all_referrals(db, skip=skip, limit=limit, min_status=STATUS_STARTED)
 
     results = []
     for ref in referrals:
