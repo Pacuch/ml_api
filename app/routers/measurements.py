@@ -8,8 +8,8 @@ from ..core.config import STATUS_SIGNED, STATUS_STARTED
 
 router = APIRouter(
     prefix="/measurements",
-    tags=["measurements"]
-    # dependencies=[Depends(get_api_key)]  # Apply security globally here
+    tags=["measurements"],
+    dependencies=[Depends(get_api_key)]
 )
 
 
