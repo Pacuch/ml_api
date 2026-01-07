@@ -15,7 +15,7 @@ def get_all_referrals(db: Session, skip: int = 0, limit: int = 100, min_status: 
 
     if min_status is not None:
         # Started (5), Saved (6), Signed (7)
-        query = query.filter(models.Referral.status >= min_status)
+        query = query.filter(models.Referral.status > min_status)
 
 
     return query.order_by(desc(models.Referral.study_datetime)) \
