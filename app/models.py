@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, JSON
+from sqlalchemy import Column, Integer, String, ForeignKey, JSON, DateTime
 from sqlalchemy.orm import relationship
 from .database import Base
 
@@ -12,7 +12,8 @@ class Referral(Base):
 
     # Relationship: One Referral has many StudyDescriptions
     study_descriptions = relationship("StudyDescription", back_populates="referral")
-
+    status = Column(Integer)
+    study_datetime = Column(DateTime, nullable=True)
 
 class StudyDescription(Base):
     __tablename__ = "ris_studydescription"

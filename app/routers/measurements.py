@@ -11,6 +11,7 @@ router = APIRouter(
 )
 
 SECRET_PEPPER = os.getenv("SECRET_PEPPER", "default_insecure_pepper")
+STATUS_SIGNED = 7
 
 def hash_patient_id(original_id: str) -> str:
     """Hashes the patient ID with a secret pepper."""
@@ -24,7 +25,7 @@ def hash_patient_id(original_id: str) -> str:
 @router.get("/", response_model=List[schemas.StudySummary])
 def list_measurements(
         skip: int = 0,
-        limit: int = 100,
+        limit: int = Query(default=25, le=1000, description="Limit results (Max 1000)"),
         db: Session = Depends(database.get_db)
 ):
     """
