@@ -30,7 +30,7 @@ def list_measurements(
         results.append(schemas.StudySummary(
             referral_id=ref.id,
             study_id=ref.study_id,
-            patient_id=ref.patient_id,
+            # patient_id=ref.patient_id,
             has_measurements=has_data
         ))
     return results
