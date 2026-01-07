@@ -21,7 +21,7 @@ def list_measurements(
         db: Session = Depends(database.get_db)
 ):
     # Note: Added STATUS_SIGNED here based on your previous request
-    referrals = crud.get_all_referrals(db, skip=skip, limit=limit, status=STATUS_SIGNED)
+    referrals = crud.get_all_referrals(db, skip=skip, limit=limit)
 
     results = []
     for ref in referrals:
