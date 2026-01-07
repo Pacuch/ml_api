@@ -7,6 +7,7 @@ class Referral(Base):
     __tablename__ = "ris_referral"  # Maps to Django app 'ris', model 'Referral'
 
     id = Column(Integer, primary_key=True, index=True)
+    study_id = Column(String)
     patient_id = Column(String, index=True)
     patient_firstname = Column(String)
     patient_lastname = Column(String)
