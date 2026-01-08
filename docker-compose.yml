@@ -10,11 +10,6 @@ services:
     env_file:
       - .envs/ml.env
       - .envs/db.env
-    environment:
-      DB_HOST: lavie_postgres
-      DB_USER: postgres
-      DB_PASSWORD: postgres
-      DB_NAME: lavie
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8512/" ]
       interval: 30s      # Check every 30 seconds
