@@ -3,8 +3,6 @@ services:
     build: .
     container_name: measurement-api
     restart: always
-    ports:
-      - "8512:8512"  # Expose on port 8000 of your host machine
     networks:
       - lavie_database
     env_file:
@@ -12,10 +10,24 @@ services:
       - .envs/db.env
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8512/" ]
-      interval: 30s      # Check every 30 seconds
-      timeout: 5s       # Fail if it takes longer than 5s
-      retries: 3         # Mark unhealthy after 3 failures
-      start_period: 15s  # Give the app 10s to start up before checking
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  nginx:
+    image: nginx:stable-alpine
+    container_name: nginx-proxy
+    restart: always
+    ports:
+      - "8512:8512"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - ./nginx/certs:/etc/nginx/certs  # Certs directory
+    depends_on:
+      - ml_api
+    networks:
+      - lavie_database
 
 networks:
   lavie_database:
