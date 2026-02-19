@@ -152,7 +152,7 @@ async def anonymize_by_index(
 
     async with httpx.AsyncClient() as client:
         ris_res = await client.get(
-            f"{ris_url}/referrals/study-by-index/{study_idx}",
+            f"{ris_url}/referrals/study-by-index/{study_idx}/",
             headers={"X-Anonymizer-Key": x_anonymizer_key}
         )
         if ris_res.status_code != 200:

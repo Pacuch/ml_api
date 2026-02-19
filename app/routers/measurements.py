@@ -72,8 +72,10 @@ async def list_measurements(
 
         if has_desc:
             async with httpx.AsyncClient() as client:
+                target_url = f"{ris_url}/referrals/study-by-index/{i}/"
+                logger.info(f"DEBUG: Calling RIS URL: {target_url}")
                 ris_res = await client.get(
-                    f"{ris_url}/referrals/study-by-index/{i}",
+                    target_url,
                     headers={"X-Anonymizer-Key": anonymizer_key},
                     timeout=5.0
                 )
