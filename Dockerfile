@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 2. Copy the application code
 COPY ./app ./app
+COPY ./anonym ./anonym
 
 # 3. Command to run the application
 # We use host 0.0.0.0 so it is accessible outside the container
