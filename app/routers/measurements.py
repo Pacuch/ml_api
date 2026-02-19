@@ -59,21 +59,24 @@ async def list_measurements(
     # Temporarily RELAX filters to see what's happening
     referrals = crud.get_all_referrals(db, skip=skip, limit=limit)
     
-    ris_url = os.getenv('RIS_API_URL', "")
+    ris_url = os.getenv('RIS_API_URL', "").rstrip('/')
     anonymizer_key = os.getenv('ANONYMIZER_API_KEY', "")
+
+    logger.info(f"DEBUG: Starting measurements sync. RIS_URL={ris_url}")
+    
+    if not ris_url:
+        raise HTTPException(status_code=500, detail="RIS_API_URL not configured")
 
     results = []
     logger.info(f"DEBUG: Processing {len(referrals)} referrals from DB")
 
     for i, ref in enumerate(referrals, start=skip + 1):
-        # Even if no measurements, let's include it for debugging
         has_desc = len(ref.study_descriptions) > 0
-        logger.info(f"DEBUG: ref_id={ref.id}, status={ref.status}, has_desc={has_desc}")
-
         if has_desc:
             async with httpx.AsyncClient() as client:
+                # Construct URL carefully
                 target_url = f"{ris_url}/referrals/study-by-index/{i}/"
-                logger.info(f"DEBUG: Calling RIS URL: {target_url}")
+                logger.info(f"DEBUG: Fetching token from: {target_url}")
                 ris_res = await client.get(
                     target_url,
                     headers={"X-Anonymizer-Key": anonymizer_key},
