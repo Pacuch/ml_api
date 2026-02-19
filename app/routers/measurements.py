@@ -1,3 +1,5 @@
+import os
+import httpx
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -12,25 +14,69 @@ router = APIRouter(
     dependencies=[Depends(get_api_key)]
 )
 
+async def get_pacs_counts(study_id: str, iot_token: str):
+    proxy_url = os.getenv('PACS_PROXY_URL')
+    headers = {"Authorization": f"Bearer {iot_token}"}
+    
+    async with httpx.AsyncClient() as client:
+        # Get series
+        series_res = await client.get(f"{proxy_url}/studies/{study_id}/series", headers=headers)
+        if series_res.status_code != 200:
+            return 0, []
+        
+        series_list = series_res.json()
+        series_len = len(series_list)
+        instance_len = []
+        
+        for idx, series in enumerate(series_list, 1):
+            series_uid = series.get("0020000E", {}).get("Value", [""])[0]
+            # Get instance count for this series
+            instances_res = await client.get(
+                f"{proxy_url}/studies/{study_id}/series/{series_uid}/instances", 
+                headers=headers
+            )
+            count = len(instances_res.json()) if instances_res.status_code == 200 else 0
+            instance_len.append(schemas.SeriesInstanceCount(series_index=idx, instance_count=count))
+            
+        return series_len, instance_len
 
 # --- Endpoint 1: Read All ---
 @router.get("/", response_model=List[schemas.StudySummary])
-def list_measurements(
+async def list_measurements(
         skip: int = 0,
         limit: int = Query(default=25, le=1000),
         db: Session = Depends(database.get_db)
 ):
-    # Note: Added STATUS_SIGNED here based on your previous request
     referrals = crud.get_all_referrals(db, skip=skip, limit=limit, min_status=STATUS_STARTED)
+    
+    ris_url = os.getenv('RIS_API_URL')
+    anonymizer_key = os.getenv('ANONYMIZER_API_KEY')
 
     results = []
-    for ref in referrals:
+    # Using a positional index for the loop to match study_idx
+    for i, ref in enumerate(referrals, start=skip + 1):
         if len(ref.study_descriptions) > 0:
-            results.append(schemas.StudySummary(
-                referral_id=ref.id,
-                study_id=ref.study_id,
-                patient_id=hash_patient_id(ref.patient_id)  # Clean function call
-            ))
+            # We need an IOT token to query counts from PACS
+            async with httpx.AsyncClient() as client:
+                # We can use the existing internal-token endpoint or the study-by-index one
+                # Let's use study-by-index to be consistent with the anonymize endpoint
+                ris_res = await client.get(
+                    f"{ris_url}/referrals/study-by-index/{i}",
+                    headers={"X-Anonymizer-Key": anonymizer_key}
+                )
+                
+                if ris_res.status_code == 200:
+                    data = ris_res.json()
+                    iot_token = data['token']
+                    series_len, instance_len = await get_pacs_counts(ref.study_id, iot_token)
+                    
+                    results.append(schemas.StudySummary(
+                        index=i,
+                        study_id=ref.study_id,
+                        patient_id=hash_patient_id(ref.patient_id),
+                        series_len=series_len,
+                        instance_len=instance_len
+                    ))
     return results
 
 

@@ -10,11 +10,16 @@ class MeasurementBase(BaseModel):
         orm_mode = True
 
 # --- 1. Summary Schema (Lightweight list) ---
+class SeriesInstanceCount(BaseModel):
+    series_index: int
+    instance_count: int
+
 class StudySummary(BaseModel):
-    referral_id: int
-    study_id: str             # The ID you want to select by
+    index: int                # Database index (referral_id)
+    study_id: str             # StudyInstanceUID
     patient_id: str
-    # has_measurements: bool    # Helper to see if data exists
+    series_len: int           # Number of series
+    instance_len: List[SeriesInstanceCount] # Instances per series
 
     class Config:
         orm_mode = True
