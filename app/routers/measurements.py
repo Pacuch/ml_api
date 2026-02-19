@@ -1,5 +1,6 @@
 import os
 import httpx
+import logging
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -14,31 +15,39 @@ router = APIRouter(
     dependencies=[Depends(get_api_key)]
 )
 
+logger = logging.getLogger("uvicorn")
+
 async def get_pacs_counts(study_id: str, iot_token: str):
     proxy_url = os.getenv('PACS_PROXY_URL')
     headers = {"Authorization": f"Bearer {iot_token}"}
     
     async with httpx.AsyncClient() as client:
-        # Get series
-        series_res = await client.get(f"{proxy_url}/studies/{study_id}/series", headers=headers)
-        if series_res.status_code != 200:
-            return 0, []
-        
-        series_list = series_res.json()
-        series_len = len(series_list)
-        instance_len = []
-        
-        for idx, series in enumerate(series_list, 1):
-            series_uid = series.get("0020000E", {}).get("Value", [""])[0]
-            # Get instance count for this series
-            instances_res = await client.get(
-                f"{proxy_url}/studies/{study_id}/series/{series_uid}/instances", 
-                headers=headers
-            )
-            count = len(instances_res.json()) if instances_res.status_code == 200 else 0
-            instance_len.append(schemas.SeriesInstanceCount(series_index=idx, instance_count=count))
+        try:
+            # Get series
+            series_res = await client.get(f"{proxy_url}/studies/{study_id}/series", headers=headers, timeout=10.0)
+            if series_res.status_code != 200:
+                logger.error(f"PACS Series Error: {series_res.status_code} for study {study_id}")
+                return 0, []
             
-        return series_len, instance_len
+            series_list = series_res.json()
+            series_len = len(series_list)
+            instance_len = []
+            
+            for idx, series in enumerate(series_list, 1):
+                series_uid = series.get("0020000E", {}).get("Value", [""])[0]
+                # Get instance count for this series
+                instances_res = await client.get(
+                    f"{proxy_url}/studies/{study_id}/series/{series_uid}/instances", 
+                    headers=headers,
+                    timeout=10.0
+                )
+                count = len(instances_res.json()) if instances_res.status_code == 200 else 0
+                instance_len.append(schemas.SeriesInstanceCount(series_index=idx, instance_count=count))
+                
+            return series_len, instance_len
+        except Exception as e:
+            logger.error(f"get_pacs_counts exception: {str(e)}")
+            return 0, []
 
 # --- Endpoint 1: Read All ---
 @router.get("/", response_model=List[schemas.StudySummary])
@@ -47,24 +56,26 @@ async def list_measurements(
         limit: int = Query(default=25, le=1000),
         db: Session = Depends(database.get_db)
 ):
-    referrals = crud.get_all_referrals(db, skip=skip, limit=limit, min_status=STATUS_STARTED)
+    # Temporarily RELAX filters to see what's happening
+    referrals = crud.get_all_referrals(db, skip=skip, limit=limit)
     
     ris_url = os.getenv('RIS_API_URL', "")
     anonymizer_key = os.getenv('ANONYMIZER_API_KEY', "")
 
     results = []
-    # Using a positional index for the loop to match study_idx
+    logger.info(f"DEBUG: Processing {len(referrals)} referrals from DB")
+
     for i, ref in enumerate(referrals, start=skip + 1):
-        if len(ref.study_descriptions) > 0:
-            if not anonymizer_key:
-                raise HTTPException(status_code=500, detail="ANONYMIZER_API_KEY not configured in ML API")
-            
+        # Even if no measurements, let's include it for debugging
+        has_desc = len(ref.study_descriptions) > 0
+        logger.info(f"DEBUG: ref_id={ref.id}, status={ref.status}, has_desc={has_desc}")
+
+        if has_desc:
             async with httpx.AsyncClient() as client:
-                # We can use the existing internal-token endpoint or the study-by-index one
-                # Let's use study-by-index to be consistent with the anonymize endpoint
                 ris_res = await client.get(
                     f"{ris_url}/referrals/study-by-index/{i}",
-                    headers={"X-Anonymizer-Key": anonymizer_key}
+                    headers={"X-Anonymizer-Key": anonymizer_key},
+                    timeout=5.0
                 )
                 
                 if ris_res.status_code == 200:
@@ -78,6 +89,16 @@ async def list_measurements(
                         patient_id=hash_patient_id(ref.patient_id),
                         series_len=series_len,
                         instance_len=instance_len
+                    ))
+                else:
+                    logger.error(f"RIS Token Error: {ris_res.status_code} for index {i}")
+                    # Still add it without PACS counts if token fails
+                    results.append(schemas.StudySummary(
+                        index=i,
+                        study_id=ref.study_id,
+                        patient_id=hash_patient_id(ref.patient_id),
+                        series_len=0,
+                        instance_len=[]
                     ))
     return results
 
