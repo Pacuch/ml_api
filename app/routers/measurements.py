@@ -59,7 +59,8 @@ async def list_measurements(
     # Temporarily RELAX filters to see what's happening
     referrals = crud.get_all_referrals(db, skip=skip, limit=limit)
     
-    ris_url = os.getenv('RIS_API_URL', "").rstrip('/')
+    # ris_url = os.getenv('RIS_API_URL', "").rstrip('/')
+    ris_url = "http://apiserver:8000/app/api"
     anonymizer_key = os.getenv('ANONYMIZER_API_KEY', "")
 
     logger.info(f"DEBUG: Starting measurements sync. RIS_URL={ris_url}")
