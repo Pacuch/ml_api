@@ -49,14 +49,16 @@ async def list_measurements(
 ):
     referrals = crud.get_all_referrals(db, skip=skip, limit=limit, min_status=STATUS_STARTED)
     
-    ris_url = os.getenv('RIS_API_URL')
-    anonymizer_key = os.getenv('ANONYMIZER_API_KEY')
+    ris_url = os.getenv('RIS_API_URL', "")
+    anonymizer_key = os.getenv('ANONYMIZER_API_KEY', "")
 
     results = []
     # Using a positional index for the loop to match study_idx
     for i, ref in enumerate(referrals, start=skip + 1):
         if len(ref.study_descriptions) > 0:
-            # We need an IOT token to query counts from PACS
+            if not anonymizer_key:
+                raise HTTPException(status_code=500, detail="ANONYMIZER_API_KEY not configured in ML API")
+            
             async with httpx.AsyncClient() as client:
                 # We can use the existing internal-token endpoint or the study-by-index one
                 # Let's use study-by-index to be consistent with the anonymize endpoint

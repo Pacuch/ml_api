@@ -139,8 +139,12 @@ async def anonymize_by_index(
     if not x_anonymizer_key:
         raise HTTPException(status_code=401, detail="Missing X-Anonymizer-Key header")
 
-    ris_url = os.getenv('RIS_API_URL')
-    proxy_base_url = os.getenv('PACS_PROXY_URL')
+    ris_url = os.getenv('RIS_API_URL', "")
+    proxy_base_url = os.getenv('PACS_PROXY_URL', "")
+    anonymizer_key = os.getenv('ANONYMIZER_API_KEY', "")
+
+    if not anonymizer_key:
+        raise HTTPException(status_code=500, detail="ANONYMIZER_API_KEY not configured in ML API")
 
     async with httpx.AsyncClient() as client:
         ris_res = await client.get(
