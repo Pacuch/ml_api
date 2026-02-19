@@ -20,33 +20,47 @@ logger = logging.getLogger("uvicorn")
 async def get_pacs_counts(study_id: str, iot_token: str):
     proxy_url = os.getenv('PACS_PROXY_URL')
     headers = {"Authorization": f"Bearer {iot_token}"}
+    logger.info(f"DEBUG: Starting get_pacs_counts for {study_id} using proxy {proxy_url}")
     
     async with httpx.AsyncClient() as client:
         try:
             # Get series
             series_res = await client.get(f"{proxy_url}/studies/{study_id}/series", headers=headers, timeout=10.0)
+            logger.info(f"DEBUG: Series response for {study_id}: {series_res.status_code}")
+            
             if series_res.status_code != 200:
-                logger.error(f"PACS Series Error: {series_res.status_code} for study {study_id}")
+                logger.error(f"PACS Series Error: {series_res.status_code} Body: {series_res.text[:100]}")
                 return 0, []
             
             series_list = series_res.json()
             series_len = len(series_list)
             instance_len = []
             
+            logger.info(f"DEBUG: Found {series_len} series for study {study_id}")
+            
             for idx, series in enumerate(series_list, 1):
                 series_uid = series.get("0020000E", {}).get("Value", [""])[0]
-                # Get instance count for this series
+                logger.info(f"DEBUG: Fetching instances for series {idx}: {series_uid}")
+                
                 instances_res = await client.get(
                     f"{proxy_url}/studies/{study_id}/series/{series_uid}/instances", 
                     headers=headers,
                     timeout=10.0
                 )
-                count = len(instances_res.json()) if instances_res.status_code == 200 else 0
+                
+                if instances_res.status_code == 200:
+                    instances = instances_res.json()
+                    count = len(instances)
+                    logger.info(f"DEBUG: Series {idx} returned {count} instances.")
+                else:
+                    logger.error(f"PACS Instance Error for series {idx}: {instances_res.status_code}")
+                    count = 0
+                
                 instance_len.append(schemas.SeriesInstanceCount(series_index=idx, instance_count=count))
                 
             return series_len, instance_len
         except Exception as e:
-            logger.error(f"get_pacs_counts exception: {str(e)}")
+            logger.error(f"get_pacs_counts CRITICAL exception: {str(e)}")
             return 0, []
 
 # --- Endpoint 1: Read All ---
