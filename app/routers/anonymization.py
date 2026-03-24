@@ -5,11 +5,12 @@ import pydicom
 import zipfile
 import json
 import hashlib
-from fastapi import APIRouter, HTTPException, Header, Response
+from datetime import datetime
+from fastapi import APIRouter, HTTPException, Header, Response, Request
 from fastapi.responses import StreamingResponse
 from pydicom.uid import generate_uid
 
-router = APIRouter(prefix="/anonymize", tags=["anonymization"])
+router = APIRouter(prefix="/anonym", tags=["anonymization"])
 
 # --- Core Anonymization Engine (Ported from anonym.py) ---
 
@@ -44,36 +45,56 @@ class AnonymizerEngine:
             self.uid_map[original_uid] = generate_uid()
         return self.uid_map[original_uid]
 
-    def anonymize_dataset(self, ds):
-        # 1. Remove private tags if configured
-        ds.remove_private_tags()
+    def _process_dataset_recursive(self, dataset):
+        try:
+            dataset.remove_private_tags()
+        except:
+            pass
 
-        # 2. Iterate through tags and apply actions from JSON
-        for elem in list(ds):
+        for elem in list(dataset):
             keyword = elem.keyword
-            if not keyword or keyword not in self.rules:
+            if not keyword: continue
+
+            # --- SEQUENCE HANDLING ---
+            if elem.VR == 'SQ':
+                if keyword in self.rules and self.rules[keyword] == 'X':
+                    delattr(dataset, keyword)
+                else:
+                    for item in elem.value: 
+                        self._process_dataset_recursive(item)
                 continue
 
-            action = self.rules[keyword]
+            # --- STANDARD PROFILE RULES ---
+            if keyword in self.rules:
+                action = self.rules[keyword]
 
-            if action == 'X':
-                delattr(ds, keyword)
-            elif action == 'U':
-                if elem.value:
-                    if elem.VM > 1:
-                        elem.value = [self._generate_consistent_uid(u) for u in elem.value]
-                    else:
-                        elem.value = self._generate_consistent_uid(elem.value)
-            elif action in ['Z', 'D']:
-                elem.value = self._get_replacement_value(elem.VR, action)
+                if action == 'X':
+                    delattr(dataset, keyword)
+                elif action == 'U':
+                    if elem.value:
+                        if elem.VM > 1:
+                            elem.value = [self._generate_consistent_uid(u) for u in elem.value]
+                        else:
+                            elem.value = self._generate_consistent_uid(elem.value)
+                elif action in ['Z', 'D']:
+                    elem.value = self._get_replacement_value(elem.VR, action)
 
-        # 3. Final mandatory metadata (Following your finalize_metadata logic)
+    def anonymize_dataset(self, ds):
+        # 1. Recursive processing of the dataset
+        self._process_dataset_recursive(ds)
+
+        # 2. Final mandatory metadata (Following anonym.py logic)
         orig_patient_id = str(ds.get("PatientID", "UNKNOWN"))
         hashed_id = hashlib.sha256((orig_patient_id + self.pepper).encode()).hexdigest()
         
         ds.PatientID = hashed_id
         ds.PatientName = f"{hashed_id[:8]}^Anonym"
+        
+        today = datetime.now().strftime('%Y%m%d')
+        ds.StudyDate = ds.SeriesDate = ds.ContentDate = today
+        
         ds.PatientIdentityRemoved = "YES"
+        ds.DeidentificationMethod = "DICOM PS3.15 Basic Profile + SHA256"
         
         return ds
 
@@ -82,7 +103,69 @@ engine = AnonymizerEngine()
 
 # --- Endpoints ---
 
-@router.get("/{study_id}")
+@router.get("/{path:path}")
+async def anonymize_proxy_path(path: str, request: Request):
+    proxy_base_url = os.getenv('PACS_PROXY_URL')
+    if not proxy_base_url:
+        # Fallback to internal container name if not set
+        proxy_base_url = "http://pacs-proxy:8080"
+
+    # Handle path prefixing
+    # If the requested path is 'pacs/studies/...' and proxy_base_url is 'http://pacs-proxy:8080'
+    # we should probably strip 'pacs/' if it's just a prefix used for routing.
+    target_path = path
+    if path.startswith("pacs/"):
+        target_path = path[len("pacs/"):]
+    
+    target_url = f"{proxy_base_url.rstrip('/')}/{target_path.lstrip('/')}"
+    
+    # Forward headers from the original request (Authorization, etc.)
+    headers = dict(request.headers)
+    # Remove host header to let httpx set it
+    headers.pop("host", None)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            # Fetch the original image with query parameters
+            response = await client.get(
+                target_url, 
+                headers=headers, 
+                params=request.query_params, 
+                follow_redirects=True, 
+                timeout=30.0
+            )
+            
+            if response.status_code != 200:
+                # If the proxy fails, return the error as is
+                return Response(
+                    content=response.content, 
+                    status_code=response.status_code, 
+                    media_type=response.headers.get("content-type")
+                )
+            
+            # Check if content is DICOM
+            content_type = response.headers.get("content-type", "")
+            if "application/dicom" in content_type or path.lower().endswith(".dcm") or response.content.startswith(b'\x00' * 128 + b'DICM'):
+                try:
+                    ds = pydicom.dcmread(io.BytesIO(response.content))
+                    ds = engine.anonymize_dataset(ds)
+                    
+                    out_buf = io.BytesIO()
+                    ds.save_as(out_buf)
+                    return Response(content=out_buf.getvalue(), media_type="application/dicom")
+                except Exception as e:
+                    # If DICOM parsing fails, return original content
+                    print(f"Failed to anonymize DICOM: {e}")
+                    return Response(content=response.content, media_type=content_type)
+            
+            # If not DICOM, return original content
+            return Response(content=response.content, media_type=content_type)
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
+
+
+@router.get("/study/{study_id}")
 async def anonymize_study(
     study_id: str, 
     x_iot_token: str = Header(None)
@@ -91,6 +174,8 @@ async def anonymize_study(
         raise HTTPException(status_code=401, detail="Missing X-IOT-Token header")
 
     proxy_base_url = os.getenv('PACS_PROXY_URL')
+    if not proxy_base_url:
+        proxy_base_url = "http://pacs-proxy:8080"
     
     async def generate_zip():
         zip_buffer = io.BytesIO()
@@ -129,7 +214,7 @@ async def anonymize_study(
         headers={"Content-Disposition": f"attachment; filename=study_{study_id}.zip"}
     )
 
-@router.get("/{study_idx}/{series_idx}/{instance_idx}")
+@router.get("/by-index/{study_idx}/{series_idx}/{instance_idx}")
 async def anonymize_by_index(
     study_idx: int,
     series_idx: int,
@@ -139,16 +224,12 @@ async def anonymize_by_index(
     if not x_anonymizer_key:
         raise HTTPException(status_code=401, detail="Missing X-Anonymizer-Key header")
 
-    ris_url = os.getenv('RIS_API_URL', "")
-    proxy_base_url = os.getenv('PACS_PROXY_URL', "")
+    ris_url = os.getenv('RIS_API_URL', "http://apiserver:8000/app/api")
+    proxy_base_url = os.getenv('PACS_PROXY_URL', "http://pacs-proxy:8080")
     anonymizer_key = os.getenv('ANONYMIZER_API_KEY', "")
 
     if not anonymizer_key:
         raise HTTPException(status_code=500, detail="ANONYMIZER_API_KEY not configured in ML API")
-    if not ris_url:
-        raise HTTPException(status_code=500, detail="RIS_API_URL not configured in ML API")
-    if not proxy_base_url:
-        raise HTTPException(status_code=500, detail="PACS_PROXY_URL not configured in ML API")
 
     async with httpx.AsyncClient() as client:
         ris_res = await client.get(
