@@ -59,6 +59,7 @@ class AnonymizerEngine:
             keyword = elem.keyword
             if not keyword: continue
 
+            # --- Sequence Handling ---
             if elem.VR == 'SQ':
                 if keyword in self.rules and self.rules[keyword] == 'X':
                     delattr(dataset, keyword)
@@ -67,6 +68,7 @@ class AnonymizerEngine:
                         self._process_dataset_recursive(item)
                 continue
 
+            # --- Standard Profile Rules ---
             if keyword in self.rules:
                 action = self.rules[keyword]
                 if action == 'X':
@@ -82,15 +84,27 @@ class AnonymizerEngine:
 
     def anonymize_dataset(self, ds, transfer_syntax=None):
         self._process_dataset_recursive(ds)
-        if transfer_syntax:
-            if not hasattr(ds, 'file_meta'):
-                ds.file_meta = pydicom.dataset.FileMetaDataset()
-            ds.file_meta.TransferSyntaxUID = UID(transfer_syntax)
+        
+        # Meta tags setup
+        if not hasattr(ds, 'file_meta'):
+            ds.file_meta = pydicom.dataset.FileMetaDataset()
             
+        if transfer_syntax:
+            ds.file_meta.TransferSyntaxUID = UID(transfer_syntax)
+        elif not hasattr(ds.file_meta, 'TransferSyntaxUID'):
+            ds.file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+        # Standard de-identification tags
         today = datetime.now().strftime('%Y%m%d')
         ds.StudyDate = ds.SeriesDate = ds.ContentDate = today
         ds.PatientIdentityRemoved = "YES"
         ds.DeidentificationMethod = "DICOM PS3.15 Basic Application Level Confidentiality Profile"
+        
+        # Ensure SOP Instance UID is in file_meta too
+        ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+        ds.file_meta.MediaStorageSOPClassUID = ds.SOPClassUID
+        ds.file_meta.ImplementationClassUID = generate_uid()
+        
         return ds
 
 engine = AnonymizerEngine()
@@ -118,42 +132,33 @@ def parse_transfer_syntax(headers: str) -> Optional[str]:
     return m.group(1).strip('"\'') if m else None
 
 def clean_dicom_data(content: bytes, content_type: str) -> (bytes, Optional[str]):
-    """
-    Robust cleaning logic based on the user's provided working script.
-    """
-    # 1. If it's already a clean DICOM with preamble, return as is
+    # 1. Standard check
     if len(content) > 132 and content[128:132] == b"DICM":
         return content, None
 
-    # 2. Try to find multipart boundary
+    # 2. Boundary detection
     boundary = None
     if "boundary=" in content_type:
         match = re.search(r'boundary=([^;]+)', content_type)
         if match: boundary = match.group(1).strip('"').encode()
-    
     if not boundary and content.startswith(b'--'):
         boundary = content.split(b'\n')[0].rstrip(b'\r')[2:]
 
     if boundary:
         parts = content.split(b'--' + boundary)
         for part in parts:
-            # Strip leading/trailing whitespace and newlines (THE FIX)
             clean_part = part.lstrip(b'\r\n').rstrip(b'\r\n--')
-            if len(clean_part) < 64: continue
+            if len(clean_part) < 128: continue
             
-            # Find gap between headers and binary body
             header_end = clean_part.find(b"\r\n\r\n")
             body_start = header_end + 4 if header_end != -1 else clean_part.find(b"\n\n") + 2
             
             if header_end != -1 or body_start > 1:
                 h_str = clean_part[:header_end].decode('utf-8', errors='ignore')
                 body = clean_part[body_start:]
-                
-                # Check if this part looks like DICOM data
                 if "application/dicom" in h_str.lower() or b"DICM" in body[128:132] or b"DICM" in body[:4] or len(body) > 1024:
                     return body, parse_transfer_syntax(h_str)
 
-    # 3. Final fallback: just strip leading/trailing trash
     return content.strip(b'\r\n '), None
 
 def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
@@ -185,7 +190,7 @@ def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
 async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, token: str):
     buf = io.BytesIO()
     file_count = 0
-    local_engine = AnonymizerEngine()
+    local_engine = AnonymizerEngine() # Session-consistent UIDs
     
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         auth_header = {"Authorization": f"Bearer {token}"}
@@ -195,7 +200,6 @@ async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, to
             if list_res.status_code != 200: raise HTTPException(status_code=list_res.status_code)
                 
             instances = list_res.json()
-            # Sort instances by InstanceNumber (0020,0013) to ensure correct order in Weasis
             def get_inst_num(x):
                 val = (x.get("00200013") or {}).get("Value", [0])[0]
                 try: return int(val)
@@ -214,20 +218,28 @@ async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, to
                     if f_res.status_code != 200: continue
 
                     raw_data, ts_uid = clean_dicom_data(f_res.content, f_res.headers.get("content-type", ""))
-                    processed_data = raw_data
+                    processed_data = None
                     
                     try:
                         ds = pydicom.dcmread(io.BytesIO(raw_data), force=True)
+                        # CRITICAL: Preserve Study/Series UIDs consistently within the ZIP
                         ds = local_engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
+                        
                         o = io.BytesIO()
+                        # CRITICAL: Always write with 128-byte preamble for Weasis
                         ds.save_as(o, write_like_original=False)
                         processed_data = o.getvalue()
                     except Exception as e:
-                        logger.warning(f"DEBUG: Anonymization failed for {iuid}. Data starts: {raw_data[:16].hex()}. Error: {e}")
-                    
-                    zf.writestr(f"IM_{idx+1:04d}.dcm", processed_data)
-                    file_count += 1
-                except Exception as e: logger.error(f"DEBUG: Error processing instance {iuid}: {e}")
+                        logger.warning(f"Anonymization failed for {iuid}: {e}")
+                        # Fallback: if it's already a valid DICOM but failed processing, add it as is
+                        if b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4]:
+                            processed_data = raw_data
+
+                    if processed_data:
+                        zf.writestr(f"IM_{idx+1:04d}.dcm", processed_data)
+                        file_count += 1
+                except Exception as e: 
+                    logger.error(f"Error processing {iuid}: {e}")
     
     return buf.getvalue()
 
