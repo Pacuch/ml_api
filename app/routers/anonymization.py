@@ -5,10 +5,14 @@ import pydicom
 import zipfile
 import json
 import hashlib
+import re
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Header, Response, Request
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Header, Response, Request, Depends
 from fastapi.responses import StreamingResponse
 from pydicom.uid import generate_uid
+
+from ..core.security import get_api_key
 
 router = APIRouter(prefix="/anonym", tags=["anonymization"])
 
@@ -101,28 +105,71 @@ class AnonymizerEngine:
 # Global instance
 engine = AnonymizerEngine()
 
+# --- Helpers ---
+
+def extract_study_id(path: str) -> Optional[str]:
+    """
+    Extracts StudyInstanceUID from a standard PACS path.
+    Example path: pacs/studies/1.2.3.4/series/...
+    """
+    match = re.search(r'studies/([^/]+)', path)
+    if match:
+        return match.group(1)
+    return None
+
+async def get_internal_token(study_id: str) -> str:
+    """
+    Fetches an IOT token from RIS using the internal anonymizer key.
+    """
+    ris_url = os.getenv('RIS_API_URL', "http://apiserver:8000/app/api")
+    anonymizer_key = os.getenv('ANONYMIZER_API_KEY', "")
+    
+    if not anonymizer_key:
+        raise HTTPException(status_code=500, detail="ANONYMIZER_API_KEY not configured in ML API")
+        
+    async with httpx.AsyncClient() as client:
+        ris_res = await client.get(
+            f"{ris_url}/referrals/study-by-uid/{study_id}/",
+            headers={"X-Anonymizer-Key": anonymizer_key}
+        )
+        if ris_res.status_code != 200:
+            raise HTTPException(status_code=ris_res.status_code, detail=f"Failed to find study {study_id} in RIS")
+            
+        return ris_res.json()['token']
+
 # --- Endpoints ---
 
 @router.get("/{path:path}")
-async def anonymize_proxy_path(path: str, request: Request):
+async def anonymize_proxy_path(
+    path: str, 
+    request: Request,
+    api_key: Optional[str] = Depends(get_api_key)
+):
     proxy_base_url = os.getenv('PACS_PROXY_URL')
     if not proxy_base_url:
-        # Fallback to internal container name if not set
         proxy_base_url = "http://pacs-proxy:8080"
 
-    # Handle path prefixing
-    # If the requested path is 'pacs/studies/...' and proxy_base_url is 'http://pacs-proxy:8080'
-    # we should probably strip 'pacs/' if it's just a prefix used for routing.
     target_path = path
     if path.startswith("pacs/"):
         target_path = path[len("pacs/"):]
     
     target_url = f"{proxy_base_url.rstrip('/')}/{target_path.lstrip('/')}"
     
-    # Forward headers from the original request (Authorization, etc.)
+    # Forward headers (Authorization, etc.)
     headers = dict(request.headers)
-    # Remove host header to let httpx set it
     headers.pop("host", None)
+
+    # If the user is authenticated via PSK (api_key is present) but no Authorization header is provided,
+    # we need to fetch an internal IOT token to talk to the PACS proxy.
+    if api_key and not headers.get("authorization"):
+        study_id = extract_study_id(path)
+        if study_id:
+            try:
+                iot_token = await get_internal_token(study_id)
+                headers["Authorization"] = f"Bearer {iot_token}"
+            except Exception as e:
+                # If we can't get a token, we continue and let the proxy return 401 if needed
+                print(f"Internal auth failed for study {study_id}: {e}")
 
     async with httpx.AsyncClient() as client:
         try:
@@ -136,7 +183,6 @@ async def anonymize_proxy_path(path: str, request: Request):
             )
             
             if response.status_code != 200:
-                # If the proxy fails, return the error as is
                 return Response(
                     content=response.content, 
                     status_code=response.status_code, 
@@ -154,11 +200,9 @@ async def anonymize_proxy_path(path: str, request: Request):
                     ds.save_as(out_buf)
                     return Response(content=out_buf.getvalue(), media_type="application/dicom")
                 except Exception as e:
-                    # If DICOM parsing fails, return original content
                     print(f"Failed to anonymize DICOM: {e}")
                     return Response(content=response.content, media_type=content_type)
             
-            # If not DICOM, return original content
             return Response(content=response.content, media_type=content_type)
             
         except Exception as e:
@@ -168,19 +212,23 @@ async def anonymize_proxy_path(path: str, request: Request):
 @router.get("/study/{study_id}")
 async def anonymize_study(
     study_id: str, 
-    x_iot_token: str = Header(None)
+    x_iot_token: Optional[str] = Header(None),
+    api_key: Optional[str] = Depends(get_api_key)
 ):
-    if not x_iot_token:
-        raise HTTPException(status_code=401, detail="Missing X-IOT-Token header")
+    # Determine the token to use
+    iot_token = x_iot_token
+    if not iot_token and api_key:
+        iot_token = await get_internal_token(study_id)
+        
+    if not iot_token:
+        raise HTTPException(status_code=401, detail="Missing X-IOT-Token header or API Key")
 
-    proxy_base_url = os.getenv('PACS_PROXY_URL')
-    if not proxy_base_url:
-        proxy_base_url = "http://pacs-proxy:8080"
+    proxy_base_url = os.getenv('PACS_PROXY_URL', "http://pacs-proxy:8080")
     
     async def generate_zip():
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            headers = {"Authorization": f"Bearer {x_iot_token}"}
+            headers = {"Authorization": f"Bearer {iot_token}"}
             
             async with httpx.AsyncClient() as client:
                 instances_res = await client.get(f"{proxy_base_url}/studies/{study_id}/instances", headers=headers)
@@ -198,10 +246,7 @@ async def anonymize_study(
                     
                     if file_res.status_code == 200:
                         ds = pydicom.dcmread(io.BytesIO(file_res.content))
-                        
-                        # USE THE FULL ENGINE LOGIC
                         ds = engine.anonymize_dataset(ds)
-                        
                         out_buf = io.BytesIO()
                         ds.save_as(out_buf)
                         zip_file.writestr(f"instance_{idx}.dcm", out_buf.getvalue())
@@ -221,6 +266,7 @@ async def anonymize_by_index(
     instance_idx: int,
     x_anonymizer_key: str = Header(None)
 ):
+    # This endpoint already uses a PSK-like logic (x_anonymizer_key) to talk to RIS
     if not x_anonymizer_key:
         raise HTTPException(status_code=401, detail="Missing X-Anonymizer-Key header")
 
@@ -260,10 +306,7 @@ async def anonymize_by_index(
         
         if file_res.status_code == 200:
             ds = pydicom.dcmread(io.BytesIO(file_res.content))
-            
-            # USE THE FULL ENGINE LOGIC
             ds = engine.anonymize_dataset(ds)
-
             out_buf = io.BytesIO()
             ds.save_as(out_buf)
             return Response(content=out_buf.getvalue(), media_type="application/dicom")
