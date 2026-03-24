@@ -85,20 +85,16 @@ class AnonymizerEngine:
 
     def anonymize_dataset(self, ds):
         # 1. Recursive processing of the dataset
+        # This will handle PatientID, PatientName etc. based on the JSON rules
         self._process_dataset_recursive(ds)
 
-        # 2. Final mandatory metadata (Following anonym.py logic)
-        orig_patient_id = str(ds.get("PatientID", "UNKNOWN"))
-        hashed_id = hashlib.sha256((orig_patient_id + self.pepper).encode()).hexdigest()
-        
-        ds.PatientID = hashed_id
-        ds.PatientName = f"{hashed_id[:8]}^Anonym"
-        
+        # 2. Final mandatory metadata
+        # Dates are still updated to today to remove time-linkage
         today = datetime.now().strftime('%Y%m%d')
         ds.StudyDate = ds.SeriesDate = ds.ContentDate = today
         
         ds.PatientIdentityRemoved = "YES"
-        ds.DeidentificationMethod = "DICOM PS3.15 Basic Profile + SHA256"
+        ds.DeidentificationMethod = "DICOM PS3.15 Basic Application Level Confidentiality Profile"
         
         return ds
 
