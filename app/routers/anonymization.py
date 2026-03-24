@@ -96,6 +96,10 @@ def extract_study_id(path: str) -> Optional[str]:
     match = re.search(r'studies/([^/]+)', path)
     return match.group(1) if match else None
 
+def extract_series_id(path: str) -> Optional[str]:
+    match = re.search(r'series/([^/]+)', path)
+    return match.group(1) if match else None
+
 async def get_internal_token(study_id: str) -> str:
     ris_url = os.getenv('RIS_API_URL', "http://apiserver:8000/app/api")
     akey = os.getenv('ANONYMIZER_API_KEY', "")
@@ -105,55 +109,85 @@ async def get_internal_token(study_id: str) -> str:
         return res.json()['token']
 
 def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
-    """
-    Parses a multipart/related stream, anonymizes every DICOM part, and reassembles it.
-    """
     match = re.search(r'boundary=([^;]+)', content_type)
     if not match: return content
-    
     boundary = match.group(1).strip('"').encode()
-    # Parts are separated by --boundary
     raw_parts = content.split(b'--' + boundary)
-    
     new_parts = []
     for part in raw_parts:
         if not part or part.strip() == b'--': continue
-        
         header_end = part.find(b"\r\n\r\n")
         if header_end == -1:
             new_parts.append(part)
             continue
-            
         headers = part[:header_end+4]
         body = part[header_end+4:].rstrip(b"\r\n")
-        
-        # Check if this part is DICOM (by header or content)
-        is_dcm = b"application/dicom" in headers or b"DICM" in body[128:132]
-        
+        is_dcm = b"application/dicom" in headers or (len(body) > 132 and b"DICM" in body[128:132])
         if is_dcm:
             try:
                 ds = pydicom.dcmread(io.BytesIO(body), force=True)
                 ds = engine.anonymize_dataset(ds)
-                buf = io.BytesIO()
-                ds.save_as(buf)
-                body = buf.getvalue()
-            except Exception as e:
-                logger.error(f"Failed to anonymize part in multipart: {e}")
-        
+                buf = io.BytesIO(); ds.save_as(buf); body = buf.getvalue()
+            except Exception as e: logger.error(f"Failed to anonymize part: {e}")
         new_parts.append(headers + body + b"\r\n")
-        
     return b'--' + boundary + b'\r\n' + (b'--' + boundary + b'\r\n').join(new_parts) + b'--' + boundary + b'--\r\n'
+
+async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, token: str):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/dicom"}
+        async with httpx.AsyncClient() as client:
+            instances = (await client.get(f"{proxy_url}/studies/{study_id}/series/{series_id}/instances", headers=headers)).json()
+            for idx, inst in enumerate(instances):
+                iuid = inst.get("00080018", {}).get("Value", [""])[0]
+                f_res = await client.get(f"{proxy_url}/studies/{study_id}/series/{series_id}/instances/{iuid}/frames/1", headers=headers)
+                if f_res.status_code == 200:
+                    data = f_res.content
+                    # Unpack if needed
+                    if "multipart/related" in f_res.headers.get("content-type", ""):
+                        m = re.search(r'boundary=([^;]+)', f_res.headers.get("content-type"))
+                        if m:
+                            b = m.group(1).strip('"').encode()
+                            parts = data.split(b'--' + b)
+                            for p in parts:
+                                if b"DICM" in p[128:132] or b"application/dicom" in p:
+                                    data = p[p.find(b"\r\n\r\n")+4:].rstrip(b"\r\n--")
+                                    break
+                    try:
+                        ds = pydicom.dcmread(io.BytesIO(data), force=True)
+                        ds = engine.anonymize_dataset(ds)
+                        o = io.BytesIO(); ds.save_as(o)
+                        zf.writestr(f"instance_{idx}.dcm", o.getvalue())
+                    except: zf.writestr(f"instance_{idx}.dcm", data)
+    return buf.getvalue()
 
 # --- Endpoints ---
 
 @router.get("/{path:path}")
-async def anonymize_proxy_path(path: str, request: Request, api_key: Optional[str] = Depends(get_api_key)):
+async def anonymize_proxy_path(
+    path: str, 
+    request: Request, 
+    api_key: Optional[str] = Depends(get_api_key),
+    accept: Optional[str] = Header(None)
+):
     proxy_base_url = os.getenv('PACS_PROXY_URL', "http://pacs-proxy:8080")
     target_path = path[len("pacs/"):] if path.startswith("pacs/") else path
     target_url = f"{proxy_base_url.rstrip('/')}/{target_path.lstrip('/')}"
     
+    # Check if user wants a ZIP for a series or study
+    if accept and "application/zip" in accept:
+        sid = extract_study_id(path)
+        token = await get_internal_token(sid) if sid else None
+        if token:
+            serid = extract_series_id(path)
+            if serid:
+                content = await fetch_and_zip_series(proxy_base_url, sid, serid, token)
+                return Response(content=content, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=series_{serid}.zip"})
+
+    # Standard Proxy Logic
     headers = dict(request.headers)
     headers.pop("host", None)
+    # If client didn't specify Accept, or requested ZIP but we are in proxy mode, force DICOM/Multipart
     headers["Accept"] = 'application/dicom, multipart/related; type="application/dicom"'
 
     if api_key and not headers.get("authorization"):
@@ -174,13 +208,12 @@ async def anonymize_proxy_path(path: str, request: Request, api_key: Optional[st
             if "multipart/related" in c_type:
                 content = process_multipart_anonymously(content, c_type)
             else:
-                is_dicom = "application/dicom" in c_type or b"DICM" in content[128:132]
+                is_dicom = "application/dicom" in c_type or (len(content) > 132 and b"DICM" in content[128:132])
                 if is_dicom:
                     try:
                         ds = pydicom.dcmread(io.BytesIO(content), force=True)
                         ds = engine.anonymize_dataset(ds)
-                        buf = io.BytesIO(); ds.save_as(buf)
-                        content = buf.getvalue()
+                        buf = io.BytesIO(); ds.save_as(buf); content = buf.getvalue()
                     except: pass
             
             return Response(content=content, media_type=c_type)
@@ -188,37 +221,10 @@ async def anonymize_proxy_path(path: str, request: Request, api_key: Optional[st
             raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/series/{study_id}/{series_id}")
-async def anonymize_series_zip(study_id: str, series_id: str, x_iot_token: Optional[str] = Header(None), api_key: Optional[str] = Depends(get_api_key)):
+async def anonymize_series_direct(study_id: str, series_id: str, x_iot_token: Optional[str] = Header(None), api_key: Optional[str] = Depends(get_api_key)):
+    # This remains as a explicit ZIP shortcut
     token = x_iot_token or (await get_internal_token(study_id) if api_key else None)
     if not token: raise HTTPException(status_code=401)
     proxy_url = os.getenv('PACS_PROXY_URL', "http://pacs-proxy:8080")
-    
-    async def generate():
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            headers = {"Authorization": f"Bearer {token}", "Accept": "application/dicom"}
-            async with httpx.AsyncClient() as client:
-                instances = (await client.get(f"{proxy_url}/studies/{study_id}/series/{series_id}/instances", headers=headers)).json()
-                for idx, inst in enumerate(instances):
-                    iuid = inst.get("00080018", {}).get("Value", [""])[0]
-                    f_res = await client.get(f"{proxy_url}/studies/{study_id}/series/{series_id}/instances/{iuid}/frames/1", headers=headers)
-                    if f_res.status_code == 200:
-                        data = f_res.content
-                        if "multipart/related" in f_res.headers.get("content-type", ""):
-                            # Use existing logic to strip multipart for the ZIP
-                            match = re.search(r'boundary=([^;]+)', f_res.headers.get("content-type"))
-                            if match:
-                                boundary = match.group(1).strip('"').encode()
-                                parts = data.split(b'--' + boundary)
-                                for p in parts:
-                                    if b"DICM" in p[128:132] or b"application/dicom" in p:
-                                        data = p[p.find(b"\r\n\r\n")+4:].rstrip(b"\r\n--")
-                                        break
-                        try:
-                            ds = pydicom.dcmread(io.BytesIO(data), force=True)
-                            ds = engine.anonymize_dataset(ds)
-                            o = io.BytesIO(); ds.save_as(o)
-                            zf.writestr(f"instance_{idx}.dcm", o.getvalue())
-                        except: zf.writestr(f"instance_{idx}.dcm", data)
-        yield buf.getvalue()
-    return StreamingResponse(generate(), media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=series_{series_id}.zip"})
+    content = await fetch_and_zip_series(proxy_url, study_id, series_id, token)
+    return Response(content=content, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=series_{series_id}.zip"})
