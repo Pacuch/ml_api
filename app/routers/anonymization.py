@@ -171,16 +171,28 @@ async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, to
             if list_res.status_code != 200: raise HTTPException(status_code=list_res.status_code)
                 
             instances = list_res.json()
+            if instances:
+                logger.info(f"DEBUG: First instance JSON structure: {json.dumps(instances[0])[:500]}")
+
             for idx, inst in enumerate(instances):
-                # Robust UID extraction
-                iuid = (inst.get("00080018") or {}).get("Value", [None])[0] or inst.get("SOPInstanceUID", {}).get("Value", [None])[0]
-                if not iuid: continue
+                # Robust UID extraction - checking multiple possible formats
+                iuid = (inst.get("00080018") or {}).get("Value", [None])[0] or \
+                       (inst.get("SOPInstanceUID") or {}).get("Value", [None])[0] or \
+                       inst.get("00080018") or \
+                       inst.get("SOPInstanceUID")
+                
+                if not iuid:
+                    logger.warning(f"DEBUG: Could not extract UID for instance {idx}. Keys: {list(inst.keys())}")
+                    continue
                 
                 # Fetching the instance (WADO-RS)
                 f_url = f"{proxy_url.rstrip('/')}/studies/{study_id}/series/{series_id}/instances/{iuid}"
-                f_res = await client.get(f_url, headers={**auth_header, "Accept": "application/dicom, multipart/related"}, timeout=30.0)
-                
-                if f_res.status_code == 200:
+                try:
+                    f_res = await client.get(f_url, headers={**auth_header, "Accept": "application/dicom, multipart/related"}, timeout=30.0)
+                    
+                    if f_res.status_code != 200:
+                        logger.error(f"DEBUG: Failed to fetch {iuid} (Status: {f_res.status_code})")
+                        continue
                     data, c_type = f_res.content, f_res.headers.get("content-type", "")
                     ts_uid = None
                     
