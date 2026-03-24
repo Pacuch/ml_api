@@ -95,6 +95,7 @@ class AnonymizerEngine:
         ds.DeidentificationMethod = "DICOM PS3.15 Basic Application Level Confidentiality Profile"
         return ds
 
+# Global instance
 engine = AnonymizerEngine()
 
 # --- Helpers ---
@@ -118,11 +119,38 @@ async def get_internal_token(study_id: str) -> str:
         return res.json()['token']
 
 def parse_transfer_syntax(headers: str) -> Optional[str]:
-    """Helper to find transfer-syntax in MIME headers."""
     m = re.search(r'transfer-syntax=([^;\s\r\n]+)', headers)
     if m:
         return m.group(1).strip('"\'')
     return None
+
+def clean_dicom_data(content: bytes, content_type: str) -> (bytes, Optional[str]):
+    """
+    Strips multipart headers and cleans trailing newlines.
+    Returns (cleaned_bytes, transfer_syntax_uid)
+    """
+    if "multipart/related" not in content_type:
+        # Standard cleaning for loose DICOM files
+        return content.lstrip(b'\r\n').rstrip(b'\r\n'), None
+
+    match = re.search(r'boundary=([^;]+)', content_type)
+    if not match: return content, None
+    
+    boundary = match.group(1).strip('"').encode()
+    parts = content.split(b'--' + boundary)
+    
+    for p in parts:
+        clean_p = p.lstrip(b'\r\n').rstrip(b'\r\n--')
+        if len(clean_p) < 64: continue
+        
+        h_end = clean_p.find(b"\r\n\r\n")
+        if h_end != -1:
+            h_str = clean_p[:h_end].decode('utf-8', errors='ignore')
+            body = clean_p[h_end+4:]
+            if "application/dicom" in h_str or b"DICM" in body[128:132] or b"DICM" in body[:4]:
+                return body, parse_transfer_syntax(h_str)
+                
+    return content, None
 
 def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
     match = re.search(r'boundary=([^;]+)', content_type)
@@ -132,7 +160,6 @@ def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
     
     new_parts = []
     for part in raw_parts:
-        # THE FIX: Strip leading/trailing newlines to prevent offset bugs
         clean_part = part.lstrip(b'\r\n').rstrip(b'\r\n--')
         if len(clean_part) < 64: continue
         
@@ -149,7 +176,6 @@ def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
         
         if is_dcm:
             try:
-                # THE FIX: force=True to handle missing preambles
                 ds = pydicom.dcmread(io.BytesIO(body), force=True)
                 ds = engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
                 buf = io.BytesIO(); ds.save_as(buf); body = buf.getvalue()
@@ -163,67 +189,57 @@ def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
 async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, token: str):
     buf = io.BytesIO()
     file_count = 0
+    # Use a local engine for the ZIP to ensure consistent UIDs across the series
+    local_engine = AnonymizerEngine()
+    
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         auth_header = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient() as client:
             list_url = f"{proxy_url.rstrip('/')}/studies/{study_id}/series/{series_id}/instances"
             list_res = await client.get(list_url, headers={**auth_header, "Accept": "application/dicom+json"}, timeout=20.0)
-            if list_res.status_code != 200: raise HTTPException(status_code=list_res.status_code)
+            if list_res.status_code != 200: 
+                logger.error(f"Failed to fetch instance list: {list_res.status_code}")
+                raise HTTPException(status_code=list_res.status_code)
                 
             instances = list_res.json()
-            if instances:
-                logger.info(f"DEBUG: First instance JSON structure: {json.dumps(instances[0])[:500]}")
+            logger.info(f"DEBUG: Processing ZIP for {len(instances)} instances")
 
             for idx, inst in enumerate(instances):
-                # Robust UID extraction - checking multiple possible formats
                 iuid = (inst.get("00080018") or {}).get("Value", [None])[0] or \
                        (inst.get("SOPInstanceUID") or {}).get("Value", [None])[0] or \
                        inst.get("00080018") or \
                        inst.get("SOPInstanceUID")
                 
-                if not iuid:
-                    logger.warning(f"DEBUG: Could not extract UID for instance {idx}. Keys: {list(inst.keys())}")
-                    continue
+                if not iuid: continue
                 
-                # Fetching the instance (WADO-RS)
                 f_url = f"{proxy_url.rstrip('/')}/studies/{study_id}/series/{series_id}/instances/{iuid}"
                 try:
                     f_res = await client.get(f_url, headers={**auth_header, "Accept": "application/dicom, multipart/related"}, timeout=30.0)
                     
                     if f_res.status_code != 200:
-                        logger.error(f"DEBUG: Failed to fetch {iuid} (Status: {f_res.status_code})")
+                        logger.error(f"DEBUG: Failed to fetch instance {iuid} (Status: {f_res.status_code})")
                         continue
-                    data, c_type = f_res.content, f_res.headers.get("content-type", "")
-                    ts_uid = None
+
+                    # CLEAN the data from multipart headers before anything else
+                    raw_data, ts_uid = clean_dicom_data(f_res.content, f_res.headers.get("content-type", ""))
+                    processed_data = raw_data
                     
-                    if "multipart/related" in c_type:
-                        match = re.search(r'boundary=([^;]+)', c_type)
-                        if match:
-                            b = match.group(1).strip('"').encode()
-                            parts = data.split(b'--' + b)
-                            for p in parts:
-                                clean_p = p.lstrip(b'\r\n').rstrip(b'\r\n--')
-                                if len(clean_p) < 64: continue
-                                h_end = clean_p.find(b"\r\n\r\n")
-                                if h_end != -1:
-                                    h_str = clean_p[:h_end].decode('utf-8', errors='ignore')
-                                    p_body = clean_p[h_end+4:]
-                                    if "application/dicom" in h_str or b"DICM" in p_body[128:132] or b"DICM" in p_body[:4]:
-                                        data, ts_uid = p_body, parse_transfer_syntax(h_str)
-                                        break
                     try:
-                        ds = pydicom.dcmread(io.BytesIO(data), force=True)
-                        ds = engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
-                        o = io.BytesIO(); ds.save_as(o); data = o.getvalue()
+                        ds = pydicom.dcmread(io.BytesIO(raw_data), force=True)
+                        ds = local_engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
+                        o = io.BytesIO()
+                        # Always write with preamble to ensure Weasis compatibility
+                        ds.save_as(o, write_like_original=False)
+                        processed_data = o.getvalue()
                     except Exception as e:
-                        logger.warning(f"Zip anonymization failed for {iuid}: {e}")
+                        logger.warning(f"DEBUG: Anonymization failed for {iuid}, adding cleaned original. Error: {e}")
                     
-                    zf.writestr(f"IM_{idx+1:04d}.dcm", data)
+                    zf.writestr(f"IM_{idx+1:04d}.dcm", processed_data)
                     file_count += 1
                 except Exception as e:
                     logger.error(f"DEBUG: Error processing instance {iuid}: {e}")
     
-    logger.info(f"DEBUG: ZIP created with {file_count} files")
+    logger.info(f"DEBUG: Final ZIP created with {file_count} files")
     return buf.getvalue()
 
 # --- Endpoints ---
@@ -256,16 +272,24 @@ async def anonymize_proxy_path(path: str, request: Request, api_key: Optional[st
         try:
             res = await client.get(target_url, headers=headers, params=request.query_params, follow_redirects=True, timeout=60.0)
             if res.status_code != 200: return Response(content=res.content, status_code=res.status_code, media_type=res.headers.get("content-type"))
-            c_type, content = res.headers.get("content-type", ""), res.content
-            if "multipart/related" in c_type: content = process_multipart_anonymously(content, c_type)
+            
+            # Use the new robust cleaning logic
+            c_type = res.headers.get("content-type", "")
+            if "multipart/related" in c_type:
+                content = process_multipart_anonymously(res.content, c_type)
             else:
-                is_dicom = "application/dicom" in c_type or b"DICM" in content[128:132] or b"DICM" in content[:4]
+                raw_data, ts_uid = clean_dicom_data(res.content, c_type)
+                is_dicom = "application/dicom" in c_type or b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4]
                 if is_dicom:
                     try:
-                        ds = pydicom.dcmread(io.BytesIO(content), force=True)
-                        ds = engine.anonymize_dataset(ds)
-                        buf = io.BytesIO(); ds.save_as(buf); content = buf.getvalue()
-                    except: pass
+                        ds = pydicom.dcmread(io.BytesIO(raw_data), force=True)
+                        ds = engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
+                        buf = io.BytesIO(); ds.save_as(buf, write_like_original=False)
+                        content = buf.getvalue()
+                    except: content = raw_data
+                else:
+                    content = raw_data
+            
             return Response(content=content, media_type=c_type)
         except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
