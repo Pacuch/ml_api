@@ -94,18 +94,24 @@ engine = AnonymizerEngine()
 
 def extract_study_id(path: str) -> Optional[str]:
     match = re.search(r'studies/([^/]+)', path)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1).rstrip('/')
+    return None
 
 def extract_series_id(path: str) -> Optional[str]:
     match = re.search(r'series/([^/]+)', path)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1).rstrip('/')
+    return None
 
 async def get_internal_token(study_id: str) -> str:
     ris_url = os.getenv('RIS_API_URL', "http://apiserver:8000/app/api")
     akey = os.getenv('ANONYMIZER_API_KEY', "")
     async with httpx.AsyncClient() as client:
         res = await client.get(f"{ris_url}/referrals/study-by-uid/{study_id}/", headers={"X-Anonymizer-Key": akey})
-        if res.status_code != 200: raise HTTPException(status_code=res.status_code)
+        if res.status_code != 200: 
+            logger.error(f"RIS token fetch failed for {study_id}: {res.status_code}")
+            raise HTTPException(status_code=res.status_code)
         return res.json()['token']
 
 def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
@@ -134,12 +140,14 @@ def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
 
 async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, token: str):
     buf = io.BytesIO()
+    file_count = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         auth_header = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient() as client:
-            # 1. Fetch instances list (MUST use application/dicom+json)
+            # 1. Fetch instances list
+            list_url = f"{proxy_url}/studies/{study_id}/series/{series_id}/instances"
             list_res = await client.get(
-                f"{proxy_url}/studies/{study_id}/series/{series_id}/instances", 
+                list_url, 
                 headers={**auth_header, "Accept": "application/dicom+json"},
                 timeout=20.0
             )
@@ -148,17 +156,18 @@ async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, to
                 logger.error(f"Failed to fetch instances list: {list_res.status_code} {list_res.text}")
                 raise HTTPException(status_code=list_res.status_code, detail="Failed to fetch instances list from PACS")
                 
-            try:
-                instances = list_res.json()
-            except Exception as e:
-                logger.error(f"Failed to parse instances JSON: {e}. Content: {list_res.text[:200]}")
-                raise HTTPException(status_code=500, detail="PACS returned invalid JSON for instances list")
+            instances = list_res.json()
+            logger.info(f"DEBUG: Found {len(instances)} instances in series {series_id}")
 
             # 2. Fetch and process each instance
             for idx, inst in enumerate(instances):
+                # Standard DICOM JSON tag for SOP Instance UID is 00080018
                 iuid = inst.get("00080018", {}).get("Value", [""])[0]
+                if not iuid: continue
+                
+                f_url = f"{proxy_url}/studies/{study_id}/series/{series_id}/instances/{iuid}/frames/1"
                 f_res = await client.get(
-                    f"{proxy_url}/studies/{study_id}/series/{series_id}/instances/{iuid}/frames/1", 
+                    f_url, 
                     headers={**auth_header, "Accept": "application/dicom"},
                     timeout=30.0
                 )
@@ -180,10 +189,14 @@ async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, to
                         ds = engine.anonymize_dataset(ds)
                         o = io.BytesIO()
                         ds.save_as(o)
-                        zf.writestr(f"instance_{idx}.dcm", o.getvalue())
+                        zf.writestr(f"IM_{idx+1:04d}.dcm", o.getvalue())
+                        file_count += 1
                     except Exception as e:
                         logger.warning(f"Failed to anonymize instance {idx}: {e}")
-                        zf.writestr(f"instance_{idx}.dcm", data)
+                        zf.writestr(f"IM_{idx+1:04d}.dcm", data)
+                        file_count += 1
+    
+    logger.info(f"DEBUG: ZIP created with {file_count} files")
     return buf.getvalue()
 
 # --- Endpoints ---
@@ -196,14 +209,16 @@ async def anonymize_proxy_path(
     accept: Optional[str] = Header(None)
 ):
     proxy_base_url = os.getenv('PACS_PROXY_URL', "http://pacs-proxy:8080")
+    # Clean path from trailing slash for extraction
+    clean_path = path.rstrip('/')
     target_path = path[len("pacs/"):] if path.startswith("pacs/") else path
     target_url = f"{proxy_base_url.rstrip('/')}/{target_path.lstrip('/')}"
     
     # Check if user explicitly wants a ZIP for a series or study
-    # We only do this if it's a series path (contains 'series')
-    if accept and "application/zip" in accept and "series" in path:
-        sid = extract_study_id(path)
-        serid = extract_series_id(path)
+    if accept and "application/zip" in accept and "series" in clean_path:
+        sid = extract_study_id(clean_path)
+        serid = extract_series_id(clean_path)
+        logger.info(f"DEBUG: ZIP requested for study={sid}, series={serid}")
         if sid and serid:
             try:
                 token = await get_internal_token(sid)
@@ -214,20 +229,21 @@ async def anonymize_proxy_path(
                     headers={"Content-Disposition": f"attachment; filename=series_{serid}.zip"}
                 )
             except Exception as e:
-                logger.error(f"ZIP generation failed: {e}")
-                # Fallback to standard proxy if ZIP fails
+                logger.error(f"ZIP generation failed: {str(e)}")
 
     # Standard Proxy Logic
     headers = dict(request.headers)
     headers.pop("host", None)
-    # If client didn't specify Accept, or requested ZIP but we are in proxy mode, force DICOM/Multipart
     headers["Accept"] = 'application/dicom, multipart/related; type="application/dicom"'
 
     if api_key and not headers.get("authorization"):
-        sid = extract_study_id(path)
+        sid = extract_study_id(clean_path)
         if sid:
-            try: headers["Authorization"] = f"Bearer {await get_internal_token(sid)}"
-            except: pass
+            try:
+                iot_token = await get_internal_token(sid)
+                headers["Authorization"] = f"Bearer {iot_token}"
+            except Exception as e:
+                logger.error(f"Internal auth failed for study {sid}: {e}")
 
     async with httpx.AsyncClient() as client:
         try:
@@ -251,11 +267,11 @@ async def anonymize_proxy_path(
             
             return Response(content=content, media_type=c_type)
         except Exception as e:
+            logger.error(f"Proxy global error: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/series/{study_id}/{series_id}")
 async def anonymize_series_direct(study_id: str, series_id: str, x_iot_token: Optional[str] = Header(None), api_key: Optional[str] = Depends(get_api_key)):
-    # This remains as a explicit ZIP shortcut
     token = x_iot_token or (await get_internal_token(study_id) if api_key else None)
     if not token: raise HTTPException(status_code=401)
     proxy_url = os.getenv('PACS_PROXY_URL', "http://pacs-proxy:8080")
