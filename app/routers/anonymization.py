@@ -199,15 +199,23 @@ async def anonymize_proxy_path(
     target_path = path[len("pacs/"):] if path.startswith("pacs/") else path
     target_url = f"{proxy_base_url.rstrip('/')}/{target_path.lstrip('/')}"
     
-    # Check if user wants a ZIP for a series or study
-    if accept and "application/zip" in accept:
+    # Check if user explicitly wants a ZIP for a series or study
+    # We only do this if it's a series path (contains 'series')
+    if accept and "application/zip" in accept and "series" in path:
         sid = extract_study_id(path)
-        token = await get_internal_token(sid) if sid else None
-        if token:
-            serid = extract_series_id(path)
-            if serid:
+        serid = extract_series_id(path)
+        if sid and serid:
+            try:
+                token = await get_internal_token(sid)
                 content = await fetch_and_zip_series(proxy_base_url, sid, serid, token)
-                return Response(content=content, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=series_{serid}.zip"})
+                return Response(
+                    content=content, 
+                    media_type="application/zip", 
+                    headers={"Content-Disposition": f"attachment; filename=series_{serid}.zip"}
+                )
+            except Exception as e:
+                logger.error(f"ZIP generation failed: {e}")
+                # Fallback to standard proxy if ZIP fails
 
     # Standard Proxy Logic
     headers = dict(request.headers)
