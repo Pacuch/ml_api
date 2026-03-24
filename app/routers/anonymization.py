@@ -220,6 +220,8 @@ async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, to
                     
                     zf.writestr(f"IM_{idx+1:04d}.dcm", data)
                     file_count += 1
+                except Exception as e:
+                    logger.error(f"DEBUG: Error processing instance {iuid}: {e}")
     
     logger.info(f"DEBUG: ZIP created with {file_count} files")
     return buf.getvalue()
