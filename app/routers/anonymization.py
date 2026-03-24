@@ -6,6 +6,7 @@ import zipfile
 import json
 import hashlib
 import re
+import logging
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Header, Response, Request, Depends
@@ -15,6 +16,7 @@ from pydicom.uid import generate_uid
 from ..core.security import get_api_key
 
 router = APIRouter(prefix="/anonym", tags=["anonymization"])
+logger = logging.getLogger("uvicorn")
 
 # --- Core Anonymization Engine (Ported from anonym.py) ---
 
@@ -85,11 +87,9 @@ class AnonymizerEngine:
 
     def anonymize_dataset(self, ds):
         # 1. Recursive processing of the dataset
-        # This will handle PatientID, PatientName etc. based on the JSON rules
         self._process_dataset_recursive(ds)
 
         # 2. Final mandatory metadata
-        # Dates are still updated to today to remove time-linkage
         today = datetime.now().strftime('%Y%m%d')
         ds.StudyDate = ds.SeriesDate = ds.ContentDate = today
         
@@ -104,19 +104,12 @@ engine = AnonymizerEngine()
 # --- Helpers ---
 
 def extract_study_id(path: str) -> Optional[str]:
-    """
-    Extracts StudyInstanceUID from a standard PACS path.
-    Example path: pacs/studies/1.2.3.4/series/...
-    """
     match = re.search(r'studies/([^/]+)', path)
     if match:
         return match.group(1)
     return None
 
 async def get_internal_token(study_id: str) -> str:
-    """
-    Fetches an IOT token from RIS using the internal anonymizer key.
-    """
     ris_url = os.getenv('RIS_API_URL', "http://apiserver:8000/app/api")
     anonymizer_key = os.getenv('ANONYMIZER_API_KEY', "")
     
@@ -132,6 +125,26 @@ async def get_internal_token(study_id: str) -> str:
             raise HTTPException(status_code=ris_res.status_code, detail=f"Failed to find study {study_id} in RIS")
             
         return ris_res.json()['token']
+
+def unpack_multipart_dicom(content: bytes, content_type: str) -> Optional[bytes]:
+    """
+    Simplistic parser for multipart/related content to extract the DICOM part.
+    """
+    match = re.search(r'boundary=([^;]+)', content_type)
+    if not match:
+        return None
+        
+    boundary = match.group(1).strip('"')
+    parts = content.split(f"--{boundary}".encode())
+    
+    for part in parts:
+        if b"application/dicom" in part or b"DICM" in part:
+            # Find start of body (after headers)
+            header_end = part.find(b"\r\n\r\n")
+            if header_end != -1:
+                return part[header_end+4:].rstrip(b"\r\n--")
+            
+    return None
 
 # --- Endpoints ---
 
@@ -154,9 +167,11 @@ async def anonymize_proxy_path(
     # Forward headers (Authorization, etc.)
     headers = dict(request.headers)
     headers.pop("host", None)
+    
+    # Force requesting application/dicom to avoid multipart JPEGs if possible
+    headers["Accept"] = 'application/dicom, multipart/related; type="application/dicom"'
 
-    # If the user is authenticated via PSK (api_key is present) but no Authorization header is provided,
-    # we need to fetch an internal IOT token to talk to the PACS proxy.
+    # PSK Auth logic
     if api_key and not headers.get("authorization"):
         study_id = extract_study_id(path)
         if study_id:
@@ -164,12 +179,10 @@ async def anonymize_proxy_path(
                 iot_token = await get_internal_token(study_id)
                 headers["Authorization"] = f"Bearer {iot_token}"
             except Exception as e:
-                # If we can't get a token, we continue and let the proxy return 401 if needed
                 print(f"Internal auth failed for study {study_id}: {e}")
 
     async with httpx.AsyncClient() as client:
         try:
-            # Fetch the original image with query parameters
             response = await client.get(
                 target_url, 
                 headers=headers, 
@@ -185,11 +198,24 @@ async def anonymize_proxy_path(
                     media_type=response.headers.get("content-type")
                 )
             
-            # Check if content is DICOM
             content_type = response.headers.get("content-type", "")
-            if "application/dicom" in content_type or path.lower().endswith(".dcm") or response.content.startswith(b'\x00' * 128 + b'DICM'):
+            raw_content = response.content
+            
+            # Handle Multipart
+            if "multipart/related" in content_type:
+                unpacked = unpack_multipart_dicom(raw_content, content_type)
+                if unpacked:
+                    raw_content = unpacked
+                    content_type = "application/dicom"
+
+            # Check if content is DICOM
+            is_dicom = "application/dicom" in content_type or \
+                       raw_content.startswith(b'\x00' * 128 + b'DICM') or \
+                       (len(raw_content) > 132 and raw_content[128:132] == b'DICM')
+
+            if is_dicom:
                 try:
-                    ds = pydicom.dcmread(io.BytesIO(response.content))
+                    ds = pydicom.dcmread(io.BytesIO(raw_content), force=True)
                     ds = engine.anonymize_dataset(ds)
                     
                     out_buf = io.BytesIO()
@@ -197,9 +223,10 @@ async def anonymize_proxy_path(
                     return Response(content=out_buf.getvalue(), media_type="application/dicom")
                 except Exception as e:
                     print(f"Failed to anonymize DICOM: {e}")
-                    return Response(content=response.content, media_type=content_type)
+                    return Response(content=raw_content, media_type="application/dicom")
             
-            return Response(content=response.content, media_type=content_type)
+            # For JPEGs or other types, we return as-is but force Content-Type if we unpacked it
+            return Response(content=raw_content, media_type=content_type)
             
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
@@ -211,7 +238,6 @@ async def anonymize_study(
     x_iot_token: Optional[str] = Header(None),
     api_key: Optional[str] = Depends(get_api_key)
 ):
-    # Determine the token to use
     iot_token = x_iot_token
     if not iot_token and api_key:
         iot_token = await get_internal_token(study_id)
@@ -224,7 +250,10 @@ async def anonymize_study(
     async def generate_zip():
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            headers = {"Authorization": f"Bearer {iot_token}"}
+            headers = {
+                "Authorization": f"Bearer {iot_token}",
+                "Accept": "application/dicom"
+            }
             
             async with httpx.AsyncClient() as client:
                 instances_res = await client.get(f"{proxy_base_url}/studies/{study_id}/instances", headers=headers)
@@ -241,11 +270,20 @@ async def anonymize_study(
                     )
                     
                     if file_res.status_code == 200:
-                        ds = pydicom.dcmread(io.BytesIO(file_res.content))
-                        ds = engine.anonymize_dataset(ds)
-                        out_buf = io.BytesIO()
-                        ds.save_as(out_buf)
-                        zip_file.writestr(f"instance_{idx}.dcm", out_buf.getvalue())
+                        content = file_res.content
+                        c_type = file_res.headers.get("content-type", "")
+                        if "multipart/related" in c_type:
+                            unpacked = unpack_multipart_dicom(content, c_type)
+                            if unpacked: content = unpacked
+                        
+                        try:
+                            ds = pydicom.dcmread(io.BytesIO(content), force=True)
+                            ds = engine.anonymize_dataset(ds)
+                            out_buf = io.BytesIO()
+                            ds.save_as(out_buf)
+                            zip_file.writestr(f"instance_{idx}.dcm", out_buf.getvalue())
+                        except:
+                            zip_file.writestr(f"instance_{idx}.dcm", content)
             
         yield zip_buffer.getvalue()
 
@@ -262,7 +300,6 @@ async def anonymize_by_index(
     instance_idx: int,
     x_anonymizer_key: str = Header(None)
 ):
-    # This endpoint already uses a PSK-like logic (x_anonymizer_key) to talk to RIS
     if not x_anonymizer_key:
         raise HTTPException(status_code=401, detail="Missing X-Anonymizer-Key header")
 
@@ -284,9 +321,12 @@ async def anonymize_by_index(
         ris_data = ris_res.json()
         study_uid = ris_data['study_uid']
         iot_token = ris_data['token']
-        proxy_headers = {"Authorization": f"Bearer {iot_token}"}
+        proxy_headers = {
+            "Authorization": f"Bearer {iot_token}",
+            "Accept": "application/dicom"
+        }
 
-        # PACS Traversal (simplified UIDs fetch)
+        # PACS Traversal
         series_res = await client.get(f"{proxy_base_url}/studies/{study_uid}/series", headers=proxy_headers)
         series_list = series_res.json()
         series_uid = series_list[series_idx-1].get("0020000E", {}).get("Value", [""])[0]
@@ -301,8 +341,17 @@ async def anonymize_by_index(
         )
         
         if file_res.status_code == 200:
-            ds = pydicom.dcmread(io.BytesIO(file_res.content))
-            ds = engine.anonymize_dataset(ds)
-            out_buf = io.BytesIO()
-            ds.save_as(out_buf)
-            return Response(content=out_buf.getvalue(), media_type="application/dicom")
+            content = file_res.content
+            c_type = file_res.headers.get("content-type", "")
+            if "multipart/related" in c_type:
+                unpacked = unpack_multipart_dicom(content, c_type)
+                if unpacked: content = unpacked
+
+            try:
+                ds = pydicom.dcmread(io.BytesIO(content), force=True)
+                ds = engine.anonymize_dataset(ds)
+                out_buf = io.BytesIO()
+                ds.save_as(out_buf)
+                return Response(content=out_buf.getvalue(), media_type="application/dicom")
+            except:
+                return Response(content=content, media_type="application/dicom")
