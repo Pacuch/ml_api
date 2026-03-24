@@ -135,15 +135,35 @@ def process_multipart_anonymously(content: bytes, content_type: str) -> bytes:
 async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, token: str):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/dicom"}
+        auth_header = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient() as client:
-            instances = (await client.get(f"{proxy_url}/studies/{study_id}/series/{series_id}/instances", headers=headers)).json()
+            # 1. Fetch instances list (MUST use application/dicom+json)
+            list_res = await client.get(
+                f"{proxy_url}/studies/{study_id}/series/{series_id}/instances", 
+                headers={**auth_header, "Accept": "application/dicom+json"},
+                timeout=20.0
+            )
+            
+            if list_res.status_code != 200:
+                logger.error(f"Failed to fetch instances list: {list_res.status_code} {list_res.text}")
+                raise HTTPException(status_code=list_res.status_code, detail="Failed to fetch instances list from PACS")
+                
+            try:
+                instances = list_res.json()
+            except Exception as e:
+                logger.error(f"Failed to parse instances JSON: {e}. Content: {list_res.text[:200]}")
+                raise HTTPException(status_code=500, detail="PACS returned invalid JSON for instances list")
+
+            # 2. Fetch and process each instance
             for idx, inst in enumerate(instances):
                 iuid = inst.get("00080018", {}).get("Value", [""])[0]
-                f_res = await client.get(f"{proxy_url}/studies/{study_id}/series/{series_id}/instances/{iuid}/frames/1", headers=headers)
+                f_res = await client.get(
+                    f"{proxy_url}/studies/{study_id}/series/{series_id}/instances/{iuid}/frames/1", 
+                    headers={**auth_header, "Accept": "application/dicom"},
+                    timeout=30.0
+                )
                 if f_res.status_code == 200:
                     data = f_res.content
-                    # Unpack if needed
                     if "multipart/related" in f_res.headers.get("content-type", ""):
                         m = re.search(r'boundary=([^;]+)', f_res.headers.get("content-type"))
                         if m:
@@ -151,14 +171,19 @@ async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, to
                             parts = data.split(b'--' + b)
                             for p in parts:
                                 if b"DICM" in p[128:132] or b"application/dicom" in p:
-                                    data = p[p.find(b"\r\n\r\n")+4:].rstrip(b"\r\n--")
-                                    break
+                                    header_end = p.find(b"\r\n\r\n")
+                                    if header_end != -1:
+                                        data = p[header_end+4:].rstrip(b"\r\n--")
+                                        break
                     try:
                         ds = pydicom.dcmread(io.BytesIO(data), force=True)
                         ds = engine.anonymize_dataset(ds)
-                        o = io.BytesIO(); ds.save_as(o)
+                        o = io.BytesIO()
+                        ds.save_as(o)
                         zf.writestr(f"instance_{idx}.dcm", o.getvalue())
-                    except: zf.writestr(f"instance_{idx}.dcm", data)
+                    except Exception as e:
+                        logger.warning(f"Failed to anonymize instance {idx}: {e}")
+                        zf.writestr(f"instance_{idx}.dcm", data)
     return buf.getvalue()
 
 # --- Endpoints ---
