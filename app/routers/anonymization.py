@@ -285,26 +285,32 @@ async def anonymize_proxy_path(path: str, request: Request, api_key: Optional[st
             c_type = res.headers.get("content-type", "")
             logger.info(f"Proxy Content-Type: {c_type}")
             
-            if "multipart/related" in c_type:
-                logger.info("Processing multipart response anonymously")
+            # Extract the raw binary if it's multipart or wrapped
+            raw_data, ts_uid = clean_dicom_data(res.content, c_type)
+            final_c_type = "application/dicom" if ("application/dicom" in c_type or b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4]) else c_type
+
+            if "multipart/related" in c_type and not (b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4]):
+                logger.info("Processing complex multipart response anonymously")
                 content = process_multipart_anonymously(res.content, c_type)
+                final_c_type = c_type # Keep multipart if we couldn't flatten it
             else:
-                raw_data, ts_uid = clean_dicom_data(res.content, c_type)
-                if "application/dicom" in c_type or b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4]:
+                if b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4] or "application/dicom" in c_type:
                     try:
-                        logger.info("Anonymizing single DICOM instance")
+                        logger.info("Anonymizing single DICOM instance (extracted from potentially multipart response)")
                         ds = pydicom.dcmread(io.BytesIO(raw_data), force=True)
                         ds = engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
                         buf = io.BytesIO()
                         ds.save_as(buf, write_like_original=False)
                         content = buf.getvalue()
+                        final_c_type = "application/dicom"
                     except Exception as e: 
                         logger.error(f"DICOM Anonymization failed: {e}")
                         content = raw_data
                 else: 
                     logger.info("Returning non-DICOM content as-is")
                     content = raw_data
-            return Response(content=content, media_type=c_type)
+            
+            return Response(content=content, media_type=final_c_type)
         except Exception as e: 
             logger.error(f"Proxy request failed: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
