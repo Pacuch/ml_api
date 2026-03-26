@@ -285,30 +285,43 @@ async def anonymize_proxy_path(path: str, request: Request, api_key: Optional[st
             c_type = res.headers.get("content-type", "")
             logger.info(f"Proxy Content-Type: {c_type}")
             
-            # Extract the raw binary if it's multipart or wrapped
-            raw_data, ts_uid = clean_dicom_data(res.content, c_type)
-            final_c_type = "application/dicom" if ("application/dicom" in c_type or b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4]) else c_type
-
-            if "multipart/related" in c_type and not (b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4]):
-                logger.info("Processing complex multipart response anonymously")
-                content = process_multipart_anonymously(res.content, c_type)
-                final_c_type = c_type # Keep multipart if we couldn't flatten it
-            else:
-                if b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4] or "application/dicom" in c_type:
+            # Decide how to process based on content-type and requested path
+            if "multipart/related" in c_type:
+                # If it's a series request (doesn't contain "instances"), we SHOULD keep it multipart
+                # to include all 35 images.
+                if "instances" not in clean_path:
+                    logger.info("Processing series multipart response (anonymizing all parts)")
+                    content = process_multipart_anonymously(res.content, c_type)
+                    final_c_type = c_type
+                else:
+                    # If it's a single instance, try to flatten it to a raw DICOM binary
+                    logger.info("Flattening single-instance multipart to raw DICOM")
+                    raw_data, ts_uid = clean_dicom_data(res.content, c_type)
                     try:
-                        logger.info("Anonymizing single DICOM instance (extracted from potentially multipart response)")
                         ds = pydicom.dcmread(io.BytesIO(raw_data), force=True)
                         ds = engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
-                        buf = io.BytesIO()
-                        ds.save_as(buf, write_like_original=False)
-                        content = buf.getvalue()
+                        buf = io.BytesIO(); ds.save_as(buf, write_like_original=False); content = buf.getvalue()
                         final_c_type = "application/dicom"
-                    except Exception as e: 
-                        logger.error(f"DICOM Anonymization failed: {e}")
+                    except: 
                         content = raw_data
+                        final_c_type = "application/dicom"
+            else:
+                # Standard non-multipart response
+                raw_data, ts_uid = clean_dicom_data(res.content, c_type)
+                if b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4] or "application/dicom" in c_type:
+                    try:
+                        logger.info("Anonymizing single DICOM instance (non-multipart)")
+                        ds = pydicom.dcmread(io.BytesIO(raw_data), force=True)
+                        ds = engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
+                        buf = io.BytesIO(); ds.save_as(buf, write_like_original=False); content = buf.getvalue()
+                        final_c_type = "application/dicom"
+                    except: 
+                        content = raw_data
+                        final_c_type = "application/dicom"
                 else: 
                     logger.info("Returning non-DICOM content as-is")
                     content = raw_data
+                    final_c_type = c_type
             
             return Response(content=content, media_type=final_c_type)
         except Exception as e: 
