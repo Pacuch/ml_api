@@ -219,6 +219,66 @@ async def fetch_and_zip_series(proxy_url: str, study_id: str, series_id: str, to
                 except Exception as e: logger.error(f"Error processing {iuid}: {e}")
     return buf.getvalue()
 
+async def fetch_and_zip_study(proxy_url: str, study_id: str, token: Optional[str] = None):
+    buf = io.BytesIO()
+    local_engine = AnonymizerEngine()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        auth_headers = get_pacs_auth_headers(token)
+        async with httpx.AsyncClient() as client:
+            # 1. Get all series in the study
+            series_list_url = f"{proxy_url.rstrip('/')}/studies/{study_id}/series"
+            series_res = await client.get(series_list_url, headers={**auth_headers, "Accept": "application/dicom+json"}, timeout=20.0)
+            if series_res.status_code != 200: raise HTTPException(status_code=series_res.status_code)
+            series_json = series_res.json()
+            
+            # Sort series by SeriesNumber
+            def get_series_num(x):
+                val = (x.get("00200011") or {}).get("Value", [0])[0]
+                try: return int(val)
+                except: return 0
+            series_json.sort(key=get_series_num)
+
+            for s_idx, s_data in enumerate(series_json):
+                serid = (s_data.get("0020000E") or {}).get("Value", [None])[0]
+                s_num = get_series_num(s_data)
+                if not serid: continue
+                
+                # 2. Get all instances in this series
+                inst_list_url = f"{proxy_url.rstrip('/')}/studies/{study_id}/series/{serid}/instances"
+                inst_res = await client.get(inst_list_url, headers={**auth_headers, "Accept": "application/dicom+json"}, timeout=20.0)
+                if inst_res.status_code != 200: continue
+                instances = inst_res.json()
+                
+                # Sort instances by InstanceNumber
+                def get_inst_num(x):
+                    val = (x.get("00200013") or {}).get("Value", [0])[0]
+                    try: return int(val)
+                    except: return 0
+                instances.sort(key=get_inst_num)
+
+                for i_idx, inst in enumerate(instances):
+                    iuid = (inst.get("00080018") or {}).get("Value", [None])[0] or \
+                           (inst.get("SOPInstanceUID") or {}).get("Value", [None])[0]
+                    if not iuid: continue
+                    i_num = get_inst_num(inst)
+                    
+                    f_url = f"{proxy_url.rstrip('/')}/studies/{study_id}/series/{serid}/instances/{iuid}"
+                    try:
+                        f_res = await client.get(f_url, headers={**auth_headers, "Accept": "application/dicom, multipart/related"}, timeout=30.0)
+                        if f_res.status_code != 200: continue
+                        raw_data, ts_uid = clean_dicom_data(f_res.content, f_res.headers.get("content-type", ""))
+                        try:
+                            ds = pydicom.dcmread(io.BytesIO(raw_data), force=True)
+                            ds = local_engine.anonymize_dataset(ds, transfer_syntax=ts_uid)
+                            o = io.BytesIO(); ds.save_as(o, write_like_original=False)
+                            # Filename format: IM-XXXX-YYYY.dcm (XXXX=series, YYYY=instance)
+                            zf.writestr(f"IM-{s_num:04d}-{i_num:04d}.dcm", o.getvalue())
+                        except Exception:
+                            if b"DICM" in raw_data[128:132] or b"DICM" in raw_data[:4]:
+                                zf.writestr(f"IM-{s_num:04d}-{i_num:04d}.dcm", raw_data)
+                    except Exception as e: logger.error(f"Error processing {iuid}: {e}")
+    return buf.getvalue()
+
 # --- Endpoints ---
 
 @router.get("/{path:path}")
@@ -233,16 +293,26 @@ async def anonymize_proxy_path(path: str, request: Request, api_key: Optional[st
     logger.info(f"Target URL: {target_url}")
     logger.info(f"Incoming Headers (Keys): {list(request.headers.keys())}")
     
-    if accept and "application/zip" in accept and "series" in clean_path:
-        logger.info("Detected ZIP request for series")
-        sid, serid = extract_study_id(clean_path), extract_series_id(clean_path)
+    if accept and "application/zip" in accept:
+        sid = extract_study_id(clean_path)
+        serid = extract_series_id(clean_path)
+        
         if sid and serid:
+            logger.info(f"Detected ZIP request for series {serid} in study {sid}")
             try:
                 token = await get_internal_token(sid) if not os.getenv("INTERNAL_AUTH_SHARED_SECRET") else None
                 content = await fetch_and_zip_series(proxy_base_url, sid, serid, token)
                 return Response(content=content, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=series_{serid}.zip"})
             except Exception as e: 
-                logger.error(f"ZIP failed: {e}", exc_info=True)
+                logger.error(f"Series ZIP failed: {e}", exc_info=True)
+        elif sid:
+            logger.info(f"Detected ZIP request for full study {sid}")
+            try:
+                token = await get_internal_token(sid) if not os.getenv("INTERNAL_AUTH_SHARED_SECRET") else None
+                content = await fetch_and_zip_study(proxy_base_url, sid, token)
+                return Response(content=content, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=study_{sid}.zip"})
+            except Exception as e:
+                logger.error(f"Study ZIP failed: {e}", exc_info=True)
 
     # Prepare headers for the proxy request
     headers = dict(request.headers)
