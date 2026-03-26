@@ -7,9 +7,10 @@ import json
 import hashlib
 import re
 import logging
+import base64
 from datetime import datetime
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Header, Response, Request, Depends
+from fastapi import APIRouter, HTTPException, Header, Response, Request, Depends, Query
 from fastapi.responses import StreamingResponse
 from pydicom.uid import generate_uid, UID
 
@@ -329,8 +330,24 @@ async def anonymize_proxy_path(path: str, request: Request, api_key: Optional[st
             raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/series/{study_id}/{series_id}")
-async def anonymize_series_direct(study_id: str, series_id: str, x_iot_token: Optional[str] = Header(None), api_key: Optional[str] = Depends(get_api_key)):
+async def anonymize_series_direct(
+    study_id: str, 
+    series_id: str, 
+    x_iot_token: Optional[str] = Header(None), 
+    api_key: Optional[str] = Depends(get_api_key), 
+    base64_encode: bool = Query(False, alias="base64"),
+    x_base64_encode: Optional[str] = Header(None)
+):
     token = x_iot_token or (await get_internal_token(study_id) if api_key and not os.getenv("INTERNAL_AUTH_SHARED_SECRET") else None)
     proxy_url = os.getenv('PACS_PROXY_URL', "http://pacs-proxy:8080")
     content = await fetch_and_zip_series(proxy_url, study_id, series_id, token)
-    return Response(content=content, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=series_{series_id}.zip"})
+    
+    # Check if Base64 is requested via Query Param OR Header
+    is_base64_requested = base64_encode or (x_base64_encode and x_base64_encode.lower() == "true")
+    
+    if is_base64_requested:
+        logger.info(f"Encoding ZIP series {series_id} as Base64 text (requested via header/query)")
+        b64_content = base64.b64encode(content).decode('utf-8')
+        return Response(content=b64_content, media_type="text/plain")
+        
+    return Response(content=content, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=series_{serid}.zip" if 'serid' in locals() else f"attachment; filename=series_{series_id}.zip"})
